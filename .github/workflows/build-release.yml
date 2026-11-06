@@ -1,4 +1,4 @@
-name: Build Vayora MDM Signed Release APK
+name: Build Vayora Signed Release APK
 
 on:
   workflow_dispatch:
@@ -11,124 +11,69 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Extract Android project
+      - name: Extract ZIP and fix signing format
         run: |
           set -e
           unzip -q vayora-mdm-agent-android.zip
           test -f vayora-mdm-agent-android/app/build.gradle.kts
-          echo "Project extracted successfully"
+          sed -i '/create("release") {/a\            storeType = "PKCS12"' vayora-mdm-agent-android/app/build.gradle.kts
 
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
 
-      - name: Configure Android SDK
-        run: |
-          set -e
+      - uses: android-actions/setup-android@v3
 
-          export ANDROID_HOME=/usr/local/lib/android/sdk
-          export ANDROID_SDK_ROOT=$ANDROID_HOME
-
-          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
-
-          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
-            -type f -name sdkmanager | sort -V | tail -n 1)
-
-          test -n "$SDKMANAGER"
-
-          yes | "$SDKMANAGER" \
-            --sdk_root="$ANDROID_HOME" --licenses || true
-
-          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
-            --install \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
-
-          echo "PATH=$ANDROID_HOME/platform-tools:$PATH" >> $GITHUB_ENV
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.9'
+          gradle-version: "8.9"
 
-      - name: Configure release signing
+      - name: Restore and validate keystore
         env:
           KS: ${{ secrets.VAYORA_KEYSTORE_B64 }}
-          KSP: ${{ secrets.VAYORA_KEYSTORE_PASSWORD }}
-          KA: ${{ secrets.VAYORA_KEY_ALIAS }}
-          KP: ${{ secrets.VAYORA_KEY_PASSWORD }}
+          PASS: ${{ secrets.VAYORA_KEYSTORE_PASSWORD }}
+          ALIAS: ${{ secrets.VAYORA_KEY_ALIAS }}
+          KPASS: ${{ secrets.VAYORA_KEY_PASSWORD }}
         run: |
           set -e
+          test -n "$KS"
+          test -n "$PASS"
+          test -n "$ALIAS"
+          test -n "$KPASS"
 
-          test -n "$KS" || {
-            echo "Missing VAYORA_KEYSTORE_B64"
-            exit 1
-          }
-
-          test -n "$KSP"
-          test -n "$KA"
-          test -n "$KP"
-
-          echo "$KS" | base64 -d > "$RUNNER_TEMP/vayora.jks"
+          echo "$KS" | base64 --decode > "$RUNNER_TEMP/vayora.p12"
 
           keytool -list \
-            -keystore "$RUNNER_TEMP/vayora.jks" \
-            -storepass "$KSP" \
-            -alias "$KA"
+            -keystore "$RUNNER_TEMP/vayora.p12" \
+            -storetype PKCS12 \
+            -storepass "$PASS" \
+            -alias "$ALIAS"
 
           {
-            echo "KEYSTORE_PATH=$RUNNER_TEMP/vayora.jks"
-            echo "KEYSTORE_PASSWORD=$KSP"
-            echo "KEY_ALIAS=$KA"
-            echo "KEY_PASSWORD=$KP"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/vayora.p12"
+            echo "KEYSTORE_PASSWORD=$PASS"
+            echo "KEY_ALIAS=$ALIAS"
+            echo "KEY_PASSWORD=$KPASS"
           } >> "$GITHUB_ENV"
 
-      - name: Build signed Release APK
+      - name: Build signed release APK
         working-directory: vayora-mdm-agent-android
-        env:
-          VERSION_CODE: ${{ github.run_number }}
+        run: gradle --no-daemon clean assembleRelease
+
+      - name: Verify APK
         run: |
           set -e
-
-          gradle --no-daemon clean assembleRelease
-
-          APK="app/build/outputs/apk/release/app-release.apk"
-
-          test -f "$APK"
-
-          echo "Release APK generated successfully"
-
-      - name: Verify APK signature
-        working-directory: vayora-mdm-agent-android
-        run: |
-          set -e
-
-          APK="app/build/outputs/apk/release/app-release.apk"
-
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" \
-            verify --verbose --print-certs "$APK"
-
-      - name: Prepare APK artifact
-        run: |
-          set -e
-
+          APK=vayora-mdm-agent-android/app/build/outputs/apk/release/app-release.apk
+          test -s "$APK"
+          apksigner verify --verbose "$APK"
           mkdir -p output
+          cp "$APK" output/vayora-mdm-agent-release.apk
 
-          cp vayora-mdm-agent-android/app/build/outputs/apk/release/app-release.apk \
-            output/vayora-mdm-agent.apk
-
-          sha256sum output/vayora-mdm-agent.apk
-
-      - name: Upload signed Release APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: vayora-mdm-release-apk
-          path: output/vayora-mdm-agent.apk
+          name: vayora-mdm-agent-release
+          path: output/vayora-mdm-agent-release.apk
           retention-days: 30
