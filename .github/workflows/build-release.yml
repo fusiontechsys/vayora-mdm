@@ -13,9 +13,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Extract ZIP and fix signing format
+      - name: Extract ZIP and fix signing
         run: |
-          set -e
+          set -euo pipefail
           unzip -q vayora-mdm-agent-android.zip
           test -f vayora-mdm-agent-android/app/build.gradle.kts
           sed -i '/create("release") {/a\            storeType = "PKCS12"' vayora-mdm-agent-android/app/build.gradle.kts
@@ -25,7 +25,19 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
+      - name: Configure Android SDK
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/build-tools/34.0.0" >> "$GITHUB_PATH"
+          test -x "$SDK/platform-tools/adb"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
@@ -38,13 +50,13 @@ jobs:
           ALIAS: ${{ secrets.VAYORA_KEY_ALIAS }}
           KPASS: ${{ secrets.VAYORA_KEY_PASSWORD }}
         run: |
-          set -e
+          set -euo pipefail
           test -n "$KS"
           test -n "$PASS"
           test -n "$ALIAS"
           test -n "$KPASS"
 
-          echo "$KS" | base64 --decode > "$RUNNER_TEMP/vayora.p12"
+          printf '%s' "$KS" | base64 --decode > "$RUNNER_TEMP/vayora.p12"
 
           keytool -list \
             -keystore "$RUNNER_TEMP/vayora.p12" \
@@ -59,14 +71,16 @@ jobs:
             echo "KEY_PASSWORD=$KPASS"
           } >> "$GITHUB_ENV"
 
-      - name: Build signed release APK
+      - name: Build signed Release APK
         working-directory: vayora-mdm-agent-android
-        run: gradle --no-daemon clean assembleRelease
-
-      - name: Verify APK
         run: |
-          set -e
-          APK=vayora-mdm-agent-android/app/build/outputs/apk/release/app-release.apk
+          set -euo pipefail
+          gradle --no-daemon clean assembleRelease
+
+      - name: Verify signed APK
+        run: |
+          set -euo pipefail
+          APK="vayora-mdm-agent-android/app/build/outputs/apk/release/app-release.apk"
           test -s "$APK"
           apksigner verify --verbose "$APK"
           mkdir -p output
