@@ -3,6 +3,9 @@ name: Build Vayora Signed Release APK
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -13,22 +16,47 @@ jobs:
 
       - name: Extract Android project
         run: |
+          set -e
           unzip -q vayora-mdm-agent-android.zip
           test -f vayora-mdm-agent-android/app/build.gradle.kts
+          echo "Project extracted successfully"
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Configure Android SDK
+        run: |
+          set -e
+
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT=$ANDROID_HOME
+
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> $GITHUB_ENV
+
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+            -type f -name sdkmanager | sort -V | tail -n 1)
+
+          test -n "$SDKMANAGER"
+
+          yes | "$SDKMANAGER" \
+            --sdk_root="$ANDROID_HOME" --licenses || true
+
+          "$SDKMANAGER" --sdk_root="$ANDROID_HOME" \
+            --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+          echo "PATH=$ANDROID_HOME/platform-tools:$PATH" >> $GITHUB_ENV
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: '8.9'
 
       - name: Configure release signing
         env:
@@ -38,30 +66,69 @@ jobs:
           KP: ${{ secrets.VAYORA_KEY_PASSWORD }}
         run: |
           set -e
-          test -n "$KS"
+
+          test -n "$KS" || {
+            echo "Missing VAYORA_KEYSTORE_B64"
+            exit 1
+          }
+
           test -n "$KSP"
           test -n "$KA"
           test -n "$KP"
 
           echo "$KS" | base64 -d > "$RUNNER_TEMP/vayora.jks"
-          keytool -list -keystore "$RUNNER_TEMP/vayora.jks" \
-            -storepass "$KSP" -alias "$KA"
 
-          echo "KEYSTORE_PATH=$RUNNER_TEMP/vayora.jks" >> "$GITHUB_ENV"
-          echo "KEYSTORE_PASSWORD=$KSP" >> "$GITHUB_ENV"
-          echo "KEY_ALIAS=$KA" >> "$GITHUB_ENV"
-          echo "KEY_PASSWORD=$KP" >> "$GITHUB_ENV"
-          echo "VERSION_CODE=$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+          keytool -list \
+            -keystore "$RUNNER_TEMP/vayora.jks" \
+            -storepass "$KSP" \
+            -alias "$KA"
+
+          {
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/vayora.jks"
+            echo "KEYSTORE_PASSWORD=$KSP"
+            echo "KEY_ALIAS=$KA"
+            echo "KEY_PASSWORD=$KP"
+          } >> "$GITHUB_ENV"
 
       - name: Build signed Release APK
         working-directory: vayora-mdm-agent-android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
         run: |
-          gradle --no-daemon assembleRelease
-          test -f app/build/outputs/apk/release/app-release.apk
+          set -e
 
-      - name: Upload Release APK
+          gradle --no-daemon clean assembleRelease
+
+          APK="app/build/outputs/apk/release/app-release.apk"
+
+          test -f "$APK"
+
+          echo "Release APK generated successfully"
+
+      - name: Verify APK signature
+        working-directory: vayora-mdm-agent-android
+        run: |
+          set -e
+
+          APK="app/build/outputs/apk/release/app-release.apk"
+
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" \
+            verify --verbose --print-certs "$APK"
+
+      - name: Prepare APK artifact
+        run: |
+          set -e
+
+          mkdir -p output
+
+          cp vayora-mdm-agent-android/app/build/outputs/apk/release/app-release.apk \
+            output/vayora-mdm-agent.apk
+
+          sha256sum output/vayora-mdm-agent.apk
+
+      - name: Upload signed Release APK
         uses: actions/upload-artifact@v4
         with:
           name: vayora-mdm-release-apk
-          path: vayora-mdm-agent-android/app/build/outputs/apk/release/app-release.apk
+          path: output/vayora-mdm-agent.apk
           retention-days: 30
