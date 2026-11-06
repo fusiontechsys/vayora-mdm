@@ -1,0 +1,199 @@
+name: Build signed release APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "vayora-mdm-agent-android.zip"
+      - ".github/workflows/build-release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-release-apk
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    name: Build and verify signed release APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract project ZIP
+        run: |
+          set -euo pipefail
+          ZIP="$GITHUB_WORKSPACE/vayora-mdm-agent-android.zip"
+          if [ ! -f "$ZIP" ]; then
+            echo "::error::vayora-mdm-agent-android.zip is not in the repository root"
+            exit 1
+          fi
+          unzip -tq "$ZIP"
+          SRC="$RUNNER_TEMP/src"
+          rm -rf "$SRC"
+          mkdir -p "$SRC"
+          unzip -q "$ZIP" -d "$SRC"
+          PROJECT="$SRC/vayora-mdm-agent-android"
+          for f in settings.gradle.kts build.gradle.kts gradle.properties app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            if [ ! -f "$PROJECT/$f" ]; then
+              echo "::error::$f not found after extraction (expected vayora-mdm-agent-android/$f inside the ZIP)"
+              exit 1
+            fi
+          done
+          echo "PROJECT_DIR=$PROJECT" >> "$GITHUB_ENV"
+          echo "Project extracted to $PROJECT"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Prepare Android SDK (pre-accepted licenses, no action)
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found at $SDKMANAGER on this runner image"
+            exit 1
+          fi
+          mkdir -p "$SDK/licenses"
+          printf '\n24333f8a63b6825ea9c5514f83c2829b004d1fee\n' > "$SDK/licenses/android-sdk-license"
+          printf '\n84831b9409646a918e30573bab4c9c91346d8abd\n' > "$SDK/licenses/android-sdk-preview-license"
+          if ! timeout 900 "$SDKMANAGER" --sdk_root="$SDK" "platforms;android-34" "build-tools;34.0.0" < /dev/null > "$RUNNER_TEMP/sdkmanager.log" 2>&1; then
+            tail -n 80 "$RUNNER_TEMP/sdkmanager.log"
+            echo "::error::sdkmanager failed to install platform 34 / build-tools 34.0.0"
+            exit 1
+          fi
+          test -f "$SDK/platforms/android-34/android.jar"
+          test -x "$SDK/build-tools/34.0.0/apksigner"
+          test -x "$SDK/build-tools/34.0.0/aapt2"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "sdk.dir=$SDK" > "$PROJECT_DIR/local.properties"
+          echo "Android SDK ready at $SDK"
+
+      - name: Restore and validate release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.VAYORA_KEYSTORE_B64 }}
+          KS_PW: ${{ secrets.VAYORA_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.VAYORA_KEY_ALIAS }}
+          KEY_PW: ${{ secrets.VAYORA_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ -n "$KEYSTORE_B64" ] || fail "Secret VAYORA_KEYSTORE_B64 is missing or empty"
+          [ -n "$KS_PW" ] || fail "Secret VAYORA_KEYSTORE_PASSWORD is missing or empty"
+          [ -n "$KEY_ALIAS" ] || fail "Secret VAYORA_KEY_ALIAS is missing or empty"
+          [ -n "$KEY_PW" ] || fail "Secret VAYORA_KEY_PASSWORD is missing or empty"
+          [ "$KS_PW" = "$KEY_PW" ] || fail "VAYORA_KEY_PASSWORD must equal VAYORA_KEYSTORE_PASSWORD (PKCS12 uses one password)"
+
+          KS="$RUNNER_TEMP/vayora-release.p12"
+          printf '%s' "$KEYSTORE_B64" | tr -d '[:space:]' | base64 -d > "$KS" || fail "VAYORA_KEYSTORE_B64 is not valid base64"
+          [ -s "$KS" ] || fail "Decoded keystore is empty"
+
+          MAGIC=$(od -An -tx1 -N4 "$KS" | tr -d ' \n')
+          if [ "$MAGIC" = "feedfeed" ]; then
+            fail "Keystore is a JKS file, not PKCS12. Regenerate it with the 'Generate release keystore' workflow."
+          fi
+
+          openssl asn1parse -inform DER -in "$KS" -i > "$RUNNER_TEMP/asn1.txt" 2>/dev/null \
+            || fail "Keystore is not a DER-encoded PKCS12 file. Regenerate it."
+          sed -n '2p' "$RUNNER_TEMP/asn1.txt" > "$RUNNER_TEMP/line2.txt"
+          grep -Eq 'INTEGER.*:03$' "$RUNNER_TEMP/line2.txt" \
+            || fail "PKCS12 PFX version is not 3. Regenerate the keystore with the 'Generate release keystore' workflow."
+
+          keytool -list -v -storetype PKCS12 -keystore "$KS" -storepass:env KS_PW -alias "$KEY_ALIAS" > "$RUNNER_TEMP/keytool.txt" 2>&1 \
+            || { tail -n 20 "$RUNNER_TEMP/keytool.txt"; fail "Keystore could not be opened with the store password, or alias '$KEY_ALIAS' does not exist"; }
+          grep -q 'Entry type: PrivateKeyEntry' "$RUNNER_TEMP/keytool.txt" \
+            || fail "Alias '$KEY_ALIAS' is not a private key entry"
+
+          echo "KEYSTORE_PATH=$KS" >> "$GITHUB_ENV"
+          echo "Keystore validated: PKCS12, PFX version 3, alias present, password accepted"
+
+      - name: Build assembleRelease
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          KEYSTORE_PASSWORD: ${{ secrets.VAYORA_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.VAYORA_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.VAYORA_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --console=plain assembleRelease
+
+      - name: Verify APK signature with apksigner
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.VAYORA_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.VAYORA_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
+          if [ ! -f "$APK" ]; then
+            ls -R "$PROJECT_DIR/app/build/outputs/apk" || true
+            fail "app-release.apk was not produced. No signed release APK exists, so nothing is uploaded."
+          fi
+          BT="$ANDROID_HOME/build-tools/34.0.0"
+
+          "$BT/apksigner" verify --verbose --print-certs "$APK" > "$RUNNER_TEMP/apksigner.txt" 2>&1 \
+            || { cat "$RUNNER_TEMP/apksigner.txt"; fail "apksigner verification failed"; }
+          cat "$RUNNER_TEMP/apksigner.txt"
+          grep -qx 'Verifies' "$RUNNER_TEMP/apksigner.txt" || fail "apksigner did not report 'Verifies'"
+          grep -q 'Verified using v2 scheme (APK Signature Scheme v2): true' "$RUNNER_TEMP/apksigner.txt" \
+            || fail "APK Signature Scheme v2 is not present"
+          SIGNERS=$(grep -c 'certificate DN:' "$RUNNER_TEMP/apksigner.txt" || true)
+          [ "$SIGNERS" = "1" ] || fail "Expected exactly one signer, found $SIGNERS"
+
+          APK_DIGEST=$(awk -F': ' '/Signer #1 certificate SHA-256 digest/ {print $2}' "$RUNNER_TEMP/apksigner.txt")
+          [ -n "$APK_DIGEST" ] || fail "Could not read the APK signing certificate digest"
+
+          keytool -exportcert -storetype PKCS12 -keystore "$KEYSTORE_PATH" \
+            -storepass:env KEYSTORE_PASSWORD -alias "$KEY_ALIAS" > "$RUNNER_TEMP/cert.der"
+          KS_DIGEST=$(sha256sum "$RUNNER_TEMP/cert.der" | awk '{print $1}')
+          [ "$APK_DIGEST" = "$KS_DIGEST" ] \
+            || fail "APK is signed by a different certificate than the release keystore (debug key or wrong key)"
+
+          "$BT/aapt2" dump badging "$APK" > "$RUNNER_TEMP/badging.txt"
+          head -n1 "$RUNNER_TEMP/badging.txt"
+          grep -q "name='com.vayora.mdm.agent'" "$RUNNER_TEMP/badging.txt" \
+            || fail "Package name is not com.vayora.mdm.agent"
+          echo "APK signature verified against the release keystore"
+
+      - name: Collect verified APK
+        env:
+          RUN_NO: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$APK" "$GITHUB_WORKSPACE/out/vayora-mdm-agent-release.apk"
+          SHA=$(sha256sum "$GITHUB_WORKSPACE/out/vayora-mdm-agent-release.apk" | awk '{print $1}')
+          {
+            echo "## Signed release APK (build #$RUN_NO)"
+            echo ""
+            echo "SHA-256: \`$SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload signed release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: vayora-mdm-agent-release
+          path: out/vayora-mdm-agent-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove decoded keystore
+        if: always()
+        run: |
+          if [ -n "${KEYSTORE_PATH:-}" ]; then rm -f "$KEYSTORE_PATH"; fi
