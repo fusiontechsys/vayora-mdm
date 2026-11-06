@@ -1,4 +1,4 @@
-name: Build Vayora Signed Release APK
+name: Build Vayora MDM Signed Release APK
 
 on:
   workflow_dispatch:
