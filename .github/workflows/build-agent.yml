@@ -26,7 +26,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -34,22 +34,39 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: 14742923
+          accept-android-sdk-licenses: false
+          packages: ""
 
-      - name: Accept licenses and install SDK
+      - name: Verify Android SDK
         run: |
-          set -e
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --install \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
+          set -euo pipefail
+
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+
+          echo "Android SDK: $SDK"
+
+          if [ ! -d "$SDK/platforms/android-34" ]; then
+            echo "ERROR: Android API 34 is not installed."
+            ls "$SDK/platforms" || true
+            exit 1
+          fi
+
+          if [ ! -d "$SDK/build-tools/34.0.0" ]; then
+            echo "ERROR: Build Tools 34.0.0 are not installed."
+            ls "$SDK/build-tools" || true
+            exit 1
+          fi
+
+          echo "Android SDK verification successful."
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
-      - name: Restore signing keystore
+      - name: Restore release keystore
         env:
           KEYSTORE_B64: ${{ secrets.VAYORA_KEYSTORE_B64 }}
           KS_PASS: ${{ secrets.VAYORA_KEYSTORE_PASSWORD }}
@@ -62,7 +79,7 @@ jobs:
              [ -z "$KS_PASS" ] || \
              [ -z "$KS_ALIAS" ] || \
              [ -z "$K_PASS" ]; then
-            echo "ERROR: Android signing secrets are missing."
+            echo "ERROR: Required signing secrets are missing."
             exit 1
           fi
 
@@ -78,6 +95,8 @@ jobs:
             echo "KEY_PASSWORD=$K_PASS"
           } >> "$GITHUB_ENV"
 
+          echo "Signing keystore restored."
+
       - name: Build release APK
         env:
           VERSION_CODE: ${{ github.run_number }}
@@ -87,22 +106,22 @@ jobs:
           gradle --no-daemon --console=plain \
             --stacktrace assembleRelease
 
-      - name: Verify APK
+      - name: Collect APK
         run: |
           set -euo pipefail
 
-          APK="app/build/outputs/apk/release/app-release.apk"
+          mkdir -p out
 
-          if [ ! -f "$APK" ]; then
-            echo "ERROR: Release APK was not found."
-            find app/build/outputs/apk -type f -name "*.apk" || true
+          APK=$(find app/build/outputs/apk/release \
+            -type f -name "*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: Release APK was not generated."
             exit 1
           fi
 
-          mkdir -p out
           cp "$APK" out/vayora-mdm-agent.apk
 
-          echo "APK successfully created."
           sha256sum out/vayora-mdm-agent.apk
 
       - name: Upload APK
