@@ -156,8 +156,6 @@ jobs:
 
       - name: Build Android APK
         shell: bash
-        env:
-          VERSION_CODE: ${{ github.run_number }}
         run: |
           set -euo pipefail
 
