@@ -1,0 +1,162 @@
+# Vayora MDM Agent - signed release APK.
+# Builds from the project ZIP that is stored in this repository (no manual extraction needed).
+# NOTE: keep this file name. The version code is github.run_number, which restarts from 1 if the
+# workflow is renamed or recreated, and an upgrade with a lower version code is refused by Android.
+name: Build Vayora MDM Agent APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract the project ZIP stored in this repository
+        run: |
+          set -euo pipefail
+          DEST="$RUNNER_TEMP/project"
+          rm -rf "$DEST" && mkdir -p "$DEST"
+          FOUND_ZIP=""
+          while IFS= read -r z; do
+            TMP="$RUNNER_TEMP/probe"
+            rm -rf "$TMP" && mkdir -p "$TMP"
+            unzip -q "$z" -d "$TMP" || continue
+            if [ -n "$(find "$TMP" -name 'settings.gradle*' -not -path '*/build/*' | head -n1)" ]; then
+              FOUND_ZIP="$z"
+              cp -r "$TMP"/. "$DEST"/
+              break
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -name "*.zip" -not -path "*/.git/*")
+          if [ -z "$FOUND_ZIP" ]; then
+            echo "::error::No ZIP in this repository contains the Vayora project (settings.gradle.kts). Upload the project ZIP to the repository root."
+            find "$GITHUB_WORKSPACE" -path "*/.git" -prune -o -print | head -200
+            exit 1
+          fi
+          echo "Extracted project from: $FOUND_ZIP"
+
+          PROJECT_DIR=$(dirname "$(find "$DEST" -name 'settings.gradle*' -not -path '*/build/*' | head -n1)")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Gradle project: $PROJECT_DIR"
+
+          MISSING=0
+          for f in settings.gradle.kts build.gradle.kts gradle.properties app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            if [ ! -f "$PROJECT_DIR/$f" ]; then
+              echo "::error::Missing in project: $f"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 0 ] || exit 1
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK packages
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n1 || true)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::No sdkmanager found under $SDK"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null
+          test -x "$SDK/build-tools/34.0.0/apksigner"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Require and restore the release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.VAYORA_KEYSTORE_B64 }}
+          KS_PASS: ${{ secrets.VAYORA_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.VAYORA_KEY_ALIAS }}
+          K_PASS: ${{ secrets.VAYORA_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KS_PASS" ] || [ -z "$KS_ALIAS" ] || [ -z "$K_PASS" ]; then
+            echo "::error::Release signing secrets are missing. Add VAYORA_KEYSTORE_B64, VAYORA_KEYSTORE_PASSWORD, VAYORA_KEY_ALIAS and VAYORA_KEY_PASSWORD."
+            exit 1
+          fi
+          KS_FILE="$RUNNER_TEMP/vayora-release.jks"
+          echo "$KEYSTORE_B64" | base64 -d > "$KS_FILE"
+          keytool -list -keystore "$KS_FILE" -storepass "$KS_PASS" -alias "$KS_ALIAS" > /dev/null
+          {
+            echo "KEYSTORE_PATH=$KS_FILE"
+            echo "KEYSTORE_PASSWORD=$KS_PASS"
+            echo "KEY_ALIAS=$KS_ALIAS"
+            echo "KEY_PASSWORD=$K_PASS"
+          } >> "$GITHUB_ENV"
+          echo "Release keystore loaded and verified."
+
+      - name: Build signed release APK
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+        run: |
+          set +e
+          cd "$PROJECT_DIR"
+          gradle --no-daemon --console=plain --stacktrace assembleRelease > "$RUNNER_TEMP/build.log" 2>&1
+          STATUS=$?
+          cat "$RUNNER_TEMP/build.log"
+          exit $STATUS
+
+      - name: Verify APK signature
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk"
+          APKSIGNER="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          test -f "$APK" || { echo "::error::Expected APK was not produced at $APK"; exit 1; }
+          "$APKSIGNER" verify --verbose --print-certs "$APK" > "$RUNNER_TEMP/signature.txt"
+          cat "$RUNNER_TEMP/signature.txt"
+          grep -q "Verified using v2 scheme (APK Signature Scheme v2): true" "$RUNNER_TEMP/signature.txt" || { echo "::error::APK is not v2-signed"; exit 1; }
+
+      - name: Collect APK and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$PROJECT_DIR/app/build/outputs/apk/release/app-release.apk" "$GITHUB_WORKSPACE/out/vayora-mdm-agent.apk"
+          CERT=$(grep -m1 "certificate SHA-256 digest" "$RUNNER_TEMP/signature.txt" | sed 's/.*digest: //')
+          {
+            echo "## Vayora MDM Agent build #${{ github.run_number }} (signed release)"
+            echo "Signing certificate SHA-256: \`$CERT\`"
+            echo "APK SHA-256: \`$(sha256sum "$GITHUB_WORKSPACE/out/vayora-mdm-agent.apk" | cut -d' ' -f1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show the real build error in the run summary
+        if: failure()
+        run: |
+          {
+            echo "## Build failed - the real error"
+            echo '```'
+            if [ -f "$RUNNER_TEMP/build.log" ]; then
+              grep -A 15 -E "What went wrong|^e: " "$RUNNER_TEMP/build.log" | head -80 || true
+            else
+              echo "Gradle did not start. See the earlier step logs."
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vayora-mdm-agent
+          path: out/vayora-mdm-agent.apk
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/build.log
+          if-no-files-found: ignore
