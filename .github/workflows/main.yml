@@ -1,4 +1,4 @@
-# Vayora MDM Agent - signed release APK.
+#Vayora MDM Agent - signed release APK.
 # NOTE: keep this file name. The version code is github.run_number, which restarts from 1 if the
 # workflow is renamed or recreated, and an upgrade with a lower version code is refused by Android.
 name: Build Vayora MDM Agent APK
