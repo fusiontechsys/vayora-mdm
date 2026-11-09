@@ -28,12 +28,19 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
       - name: Install Android SDK packages
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null
+          # The GitHub ubuntu runner already ships the Android SDK (ANDROID_HOME). Use its newest sdkmanager.
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n1)
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::No sdkmanager found under $SDK"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools" > /dev/null
+          ls "$SDK/build-tools/34.0.0/apksigner"
 
       - uses: gradle/actions/setup-gradle@v4
         with:
